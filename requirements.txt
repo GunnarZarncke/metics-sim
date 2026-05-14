@@ -1,0 +1,6 @@
+numpy
+pandas
+networkx
+matplotlib
+pytest
+# Optional: z3-solver
