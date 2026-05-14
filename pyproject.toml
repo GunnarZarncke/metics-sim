@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genmeta"
+version = "0.1.0"
+description = "Consistency-driven emergence of minimal mathematics simulation"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy",
+  "pandas",
+  "networkx",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+z3 = ["z3-solver"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
