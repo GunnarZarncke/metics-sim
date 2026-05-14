@@ -32,6 +32,8 @@ def _config_from_args(args: argparse.Namespace) -> Config:
         consistency_enabled=not args.no_consistency,
         innovation_enabled=not args.no_innovation,
         pruning_enabled=not args.no_pruning,
+        initial_conflict_prob=args.initial_conflict_prob,
+        initial_conflict_strength=args.initial_conflict_strength,
     )
 
 
@@ -51,6 +53,8 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--complete-graph", action="store_true")
     parser.add_argument("--small-world", action="store_true")
     parser.add_argument("--random-graph", action="store_true")
+    parser.add_argument("--initial-conflict-prob", type=float, default=0.12)
+    parser.add_argument("--initial-conflict-strength", type=float, default=0.45)
 
 
 def run_command(args: argparse.Namespace) -> None:
@@ -77,6 +81,23 @@ def sweep_command(args: argparse.Namespace) -> None:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
+
+    final = df.sort_values("episode").groupby(["seed", "consistency_enabled"]).tail(1)
+    metric_cols = [
+        "communicative_success_rate",
+        "contradiction_rate",
+        "mean_contradictions",
+        "current_contradictions_t035",
+        "current_contradictions_t075",
+        "high_confidence_mappings",
+        "description_length",
+        "compression_proxy",
+        "lexical_alignment",
+    ]
+    summary = final.groupby("consistency_enabled")[metric_cols].mean().reset_index()
+    summary_out = out.with_name(f"{out.stem}_summary{out.suffix}")
+    summary.to_csv(summary_out, index=False)
+    print(summary.to_string(index=False))
 
 
 def build_parser() -> argparse.ArgumentParser:

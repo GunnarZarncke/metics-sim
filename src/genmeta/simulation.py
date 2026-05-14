@@ -11,7 +11,7 @@ import pandas as pd
 
 from .agent import Agent
 from .consistency import check_theory
-from .metrics import active_mappings, active_symbols, cluster_count, description_length, lexical_alignment, mean_mapping_entropy
+from .metrics import active_mappings, active_symbols, cluster_count, description_length, high_confidence_mappings, lexical_alignment, mean_mapping_entropy
 from .predicates import Meaning, meanings_for_world
 from .world import make_world
 
@@ -36,6 +36,8 @@ class Config:
     consistency_enabled: bool = True
     pruning_enabled: bool = True
     innovation_enabled: bool = True
+    initial_conflict_prob: float = 0.12
+    initial_conflict_strength: float = 0.45
 
 
 @dataclass(frozen=True)
@@ -64,12 +66,43 @@ class Simulation:
             )
             for i in range(config.n_agents)
         ]
+        self._seed_initial_conflicts()
         self.graph = self._make_interaction_graph()
         self.worlds = [make_world(config.world_type, config.world_size, config.seed + i) for i in range(3)]
         self.success_window: deque[int] = deque(maxlen=max(1, config.log_every))
         self.contra_window: deque[int] = deque(maxlen=max(1, config.log_every))
         self.mean_contra_window: deque[float] = deque(maxlen=max(1, config.log_every))
         self.rows: list[dict[str, float | int | str | bool]] = []
+
+    def _seed_initial_conflicts(self) -> None:
+        """Seed some noisy mutually exclusive hypotheses so consistency can act.
+
+        This does not install a formal theory; it creates occasional ambiguous
+        high-weight alternatives inside known exclusivity groups.
+        """
+
+        if self.config.initial_conflict_prob <= 0:
+            return
+        groups: dict[tuple[str, int], list[Meaning]] = {}
+        for meaning in self.meaning_list:
+            if meaning.group is not None:
+                groups.setdefault((meaning.group, meaning.arity), []).append(meaning)
+        conflicting_groups = [values for values in groups.values() if len(values) >= 2]
+        if not conflicting_groups:
+            return
+        for agent in self.agents:
+            for symbol in self.symbols:
+                if agent.rng.random() >= self.config.initial_conflict_prob:
+                    continue
+                group = conflicting_groups[int(agent.rng.integers(0, len(conflicting_groups)))]
+                pair = agent.rng.choice(group, size=2, replace=False)
+                dist = agent.lexicon[symbol]
+                floor = max(1e-6, (1.0 - 2.0 * self.config.initial_conflict_strength) / max(len(dist) - 2, 1))
+                for mid in dist:
+                    dist[mid] = floor
+                for meaning in pair:
+                    dist[meaning.id] = self.config.initial_conflict_strength
+                agent.normalize_symbol(symbol)
 
     def _make_interaction_graph(self) -> nx.Graph:
         n = self.config.n_agents
@@ -97,7 +130,6 @@ class Simulation:
         if self.rng.random() < 0.55:
             return Task("unary_reference", (int(self.rng.choice(ids)),))
         return Task("binary_relation", tuple(int(x) for x in self.rng.choice(ids, size=2, replace=True)))
-
 
     def _decay_conflicts(self, agent: Agent, symbol: str, intended: str) -> None:
         """Compact a consistent symbol by weakening mutually exclusive alternatives."""
@@ -153,6 +185,14 @@ class Simulation:
     def _log_row(self, episode: int) -> None:
         desc = description_length(self.agents)
         success_rate = float(np.mean(self.success_window)) if self.success_window else 0.0
+        current_contradictions_t035 = sum(
+            check_theory(agent, self.worlds, self.meanings, threshold=0.35).contradiction_count
+            for agent in self.agents
+        )
+        current_contradictions_t075 = sum(
+            check_theory(agent, self.worlds, self.meanings, threshold=0.75).contradiction_count
+            for agent in self.agents
+        )
         self.rows.append(
             {
                 "episode": episode,
@@ -165,6 +205,9 @@ class Simulation:
                 "mean_contradictions": float(np.mean(self.mean_contra_window)) if self.mean_contra_window else 0.0,
                 "active_symbols": active_symbols(self.agents),
                 "active_mappings": active_mappings(self.agents),
+                "high_confidence_mappings": high_confidence_mappings(self.agents),
+                "current_contradictions_t035": current_contradictions_t035,
+                "current_contradictions_t075": current_contradictions_t075,
                 "mean_mapping_entropy": mean_mapping_entropy(self.agents),
                 "lexical_alignment": lexical_alignment(self.agents),
                 "closure_size_proxy": desc,

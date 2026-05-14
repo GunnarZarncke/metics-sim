@@ -66,12 +66,18 @@ Other flags:
 - `--complete-graph`
 - `--small-world`
 - `--random-graph`
+- `--initial-conflict-prob`
+- `--initial-conflict-strength`
+
+The initial conflict flags seed occasional high-weight mutually exclusive alternatives so the consistency ablation has contradictions to resolve. This is still noisy weak formalization, not a preloaded formal theory.
 
 Run a small sweep:
 
 ```bash
 python -m genmeta.cli sweep --seeds 10 --episodes 3000 --agents 50 --world object --out runs/sweep.csv
 ```
+
+The sweep writes the raw time series to the requested CSV and a companion `*_summary.csv` containing final-row means by consistency condition.
 
 ## Metrics
 
@@ -82,6 +88,9 @@ CSV logs include:
 - `mean_contradictions`: average contradiction count
 - `active_symbols`: symbols present across agents
 - `active_mappings`: symbol-meaning links above a low threshold
+- `high_confidence_mappings`: symbol-meaning links above a high-confidence threshold
+- `current_contradictions_t035`: current theory contradictions at a permissive threshold
+- `current_contradictions_t075`: current theory contradictions at a strict threshold
 - `mean_mapping_entropy`: uncertainty in mappings
 - `lexical_alignment`: mean pairwise cosine similarity of shared symbol distributions
 - `closure_size_proxy`: high-confidence mappings/rules
@@ -91,7 +100,7 @@ CSV logs include:
 
 ## Interpreting expected results
 
-With consistency enabled, contradiction rate should usually fall, lexical alignment should rise, and active mappings should remain bounded by pruning and contradiction penalties. Without consistency, local success can still improve, but homonym/synonym instability and mutually exclusive high-confidence mappings are expected to remain higher.
+With consistency enabled, contradiction rate and current contradiction counts should usually fall, lexical alignment should rise, and active/high-confidence mappings should remain bounded by pruning and contradiction penalties. Without consistency, local success can still improve, but homonym/synonym instability and mutually exclusive high-confidence mappings are expected to remain higher.
 
 ## Known limitations
 

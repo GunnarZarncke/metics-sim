@@ -30,6 +30,10 @@ def active_mappings(agents: list, threshold: float = 0.01) -> int:
     return int(sum(1 for a in agents for d in a.lexicon.values() for w in d.values() if w >= threshold))
 
 
+def high_confidence_mappings(agents: list, threshold: float = 0.5) -> int:
+    return active_mappings(agents, threshold=threshold)
+
+
 def mean_mapping_entropy(agents: list) -> float:
     entropies = [_entropy(d) for a in agents for d in a.lexicon.values()]
     return float(np.mean(entropies)) if entropies else 0.0

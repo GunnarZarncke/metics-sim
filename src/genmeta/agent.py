@@ -75,7 +75,14 @@ class Agent:
         self.lexicon[symbol].setdefault(intended_meaning, 0.01)
         w = self.lexicon[symbol][intended_meaning]
         if consistency_enabled and not consistency_result.ok:
-            self.lexicon[symbol][intended_meaning] = w - self.lr_contradiction * w
+            penalty_targets = {intended_meaning}
+            for conflict in consistency_result.details.get("conflicts", []):
+                if conflict.get("symbol") == symbol:
+                    penalty_targets.add(str(conflict.get("meaning_a")))
+                    penalty_targets.add(str(conflict.get("meaning_b")))
+            for mid in penalty_targets:
+                if mid in self.lexicon[symbol]:
+                    self.lexicon[symbol][mid] *= 1.0 - self.lr_contradiction
         elif success:
             self.lexicon[symbol][intended_meaning] = w + self.lr_success * (1.0 - w)
         else:

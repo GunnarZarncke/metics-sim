@@ -90,8 +90,22 @@ def edge() -> Meaning:
         id="edge",
         name="edge(x,y)",
         arity=2,
+        group="edge_presence",
+        description="directed edge exists",
         evaluator=lambda world, args: isinstance(world, GraphWorld)
         and world.graph.has_edge(args[0], args[1]),
+    )
+
+
+def not_edge() -> Meaning:
+    return Meaning(
+        id="not_edge",
+        name="not_edge(x,y)",
+        arity=2,
+        group="edge_presence",
+        description="directed edge does not exist",
+        evaluator=lambda world, args: isinstance(world, GraphWorld)
+        and not world.graph.has_edge(args[0], args[1]),
     )
 
 
@@ -147,18 +161,24 @@ def out_degree_ge(k: int) -> Meaning:
         id=f"out_degree_ge:{k}",
         name=f"out_degree_ge(x,{k})",
         arity=1,
-        group="out_degree_ge",
+        description=f"node out-degree is at least {k}",
         evaluator=lambda world, args: isinstance(world, GraphWorld)
         and world.graph.out_degree(args[0]) >= k,
     )
 
 
 def object_meanings() -> list[Meaning]:
-    return [*(color_is(c) for c in COLORS), *(shape_is(s) for s in SHAPES), *(size_is(z) for z in SIZES), same_color(), same_shape()]
+    return [
+        *(color_is(c) for c in COLORS),
+        *(shape_is(s) for s in SHAPES),
+        *(size_is(z) for z in SIZES),
+        same_color(),
+        same_shape(),
+    ]
 
 
 def graph_meanings() -> list[Meaning]:
-    return [edge(), path_len_2(), reachable_bounded(3), has_self_loop(), out_degree_ge(1), out_degree_ge(2)]
+    return [edge(), not_edge(), path_len_2(), reachable_bounded(3), has_self_loop(), out_degree_ge(1), out_degree_ge(2)]
 
 
 def meanings_for_world(world_type: str) -> list[Meaning]:
