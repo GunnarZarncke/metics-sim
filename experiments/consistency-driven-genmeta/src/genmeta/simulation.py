@@ -1,0 +1,263 @@
+"""Main agent-based simulation."""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+
+from .agent import Agent
+from .consistency import check_theory
+from .metrics import active_mappings, active_symbols, cluster_count, description_length, high_confidence_mappings, lexical_alignment, mean_mapping_entropy
+from .predicates import Meaning, meanings_for_world
+from .world import make_world
+
+
+@dataclass
+class Config:
+    n_agents: int = 50
+    n_episodes: int = 5000
+    world_type: str = "object"
+    world_size: int = 20
+    initial_symbols: int = 16
+    interaction_graph: str = "random"
+    lr_success: float = 0.15
+    lr_failure: float = 0.05
+    lr_contradiction: float = 0.30
+    decay: float = 0.001
+    prune_threshold: float = 0.01
+    innovation_prob: float = 0.001
+    consistency_weight: float = 3.0
+    seed: int = 0
+    log_every: int = 10
+    consistency_enabled: bool = True
+    pruning_enabled: bool = True
+    innovation_enabled: bool = True
+    initial_conflict_prob: float = 0.0
+    initial_conflict_strength: float = 0.45
+    distractor_count: int = 3
+
+
+@dataclass(frozen=True)
+class Task:
+    kind: str
+    args: tuple[int, ...]
+    candidate_args: tuple[tuple[int, ...], ...]
+
+
+class Simulation:
+    def __init__(self, config: Config):
+        self.config = config
+        self.rng = np.random.default_rng(config.seed)
+        self.meaning_list = meanings_for_world(config.world_type)
+        self.meanings: dict[str, Meaning] = {m.id: m for m in self.meaning_list}
+        self.symbols = [f"s{i}" for i in range(config.initial_symbols)]
+        self.agents = [
+            Agent.random(
+                i,
+                self.symbols,
+                self.meaning_list,
+                seed=config.seed * 100_000 + i,
+                lr_success=config.lr_success,
+                lr_failure=config.lr_failure,
+                lr_contradiction=config.lr_contradiction,
+                decay=config.decay,
+            )
+            for i in range(config.n_agents)
+        ]
+        self._seed_initial_conflicts()
+        self.graph = self._make_interaction_graph()
+        self.worlds = [make_world(config.world_type, config.world_size, config.seed + i) for i in range(3)]
+        self.success_window: deque[int] = deque(maxlen=max(1, config.log_every))
+        self.contra_window: deque[int] = deque(maxlen=max(1, config.log_every))
+        self.mean_contra_window: deque[float] = deque(maxlen=max(1, config.log_every))
+        self.rows: list[dict[str, float | int | str | bool]] = []
+
+    def _seed_initial_conflicts(self) -> None:
+        """Seed some noisy mutually exclusive hypotheses so consistency can act.
+
+        This does not install a formal theory; it creates occasional ambiguous
+        high-weight alternatives inside known exclusivity groups.
+        """
+
+        if self.config.initial_conflict_prob <= 0:
+            return
+        groups: dict[tuple[str, int], list[Meaning]] = {}
+        for meaning in self.meaning_list:
+            if meaning.group is not None:
+                groups.setdefault((meaning.group, meaning.arity), []).append(meaning)
+        conflicting_groups = [values for values in groups.values() if len(values) >= 2]
+        if not conflicting_groups:
+            return
+        for agent in self.agents:
+            for symbol in self.symbols:
+                if agent.rng.random() >= self.config.initial_conflict_prob:
+                    continue
+                group = conflicting_groups[int(agent.rng.integers(0, len(conflicting_groups)))]
+                pair = agent.rng.choice(group, size=2, replace=False)
+                dist = agent.lexicon[symbol]
+                floor = max(1e-6, (1.0 - 2.0 * self.config.initial_conflict_strength) / max(len(dist) - 2, 1))
+                for mid in dist:
+                    dist[mid] = floor
+                for meaning in pair:
+                    dist[meaning.id] = self.config.initial_conflict_strength
+                agent.normalize_symbol(symbol)
+
+    def _make_interaction_graph(self) -> nx.Graph:
+        n = self.config.n_agents
+        if self.config.interaction_graph == "complete":
+            return nx.complete_graph(n)
+        if self.config.interaction_graph == "small_world":
+            k = min(max(2, n // 10), n - 1)
+            if k % 2 == 1:
+                k -= 1
+            return nx.watts_strogatz_graph(n, max(2, k), 0.2, seed=self.config.seed)
+        graph = nx.gnp_random_graph(n, min(0.2, 4 / max(n - 1, 1)), seed=self.config.seed)
+        for i in range(n):
+            if graph.degree(i) == 0 and n > 1:
+                graph.add_edge(i, (i + 1) % n)
+        return graph
+
+    def _sample_agents(self) -> tuple[Agent, Agent]:
+        speaker_id = int(self.rng.integers(0, self.config.n_agents))
+        neighbors = list(self.graph.neighbors(speaker_id))
+        hearer_id = int(self.rng.choice(neighbors if neighbors else [i for i in range(self.config.n_agents) if i != speaker_id]))
+        return self.agents[speaker_id], self.agents[hearer_id]
+
+    def _with_distractors(self, target: tuple[int, ...], ids: list[int]) -> tuple[tuple[int, ...], ...]:
+        candidates = [target]
+        attempts = 0
+        max_candidates = min(self.config.distractor_count + 1, max(1, len(ids) ** len(target)))
+        while len(candidates) < max_candidates and attempts < 100:
+            attempts += 1
+            cand = tuple(int(x) for x in self.rng.choice(ids, size=len(target), replace=True))
+            if cand not in candidates:
+                candidates.append(cand)
+        self.rng.shuffle(candidates)
+        return tuple(candidates)
+
+    def _sample_task(self, world: object, speaker_id: int | None = None, hearer_id: int | None = None) -> Task:
+        ids = list(world.ids)  # type: ignore[attr-defined]
+        if getattr(world, "kind", None) == "resource":
+            if speaker_id is not None and hearer_id is not None and speaker_id != hearer_id:
+                target = (speaker_id, hearer_id)
+            else:
+                target = tuple(int(x) for x in self.rng.choice(ids, size=2, replace=False))
+            candidates = [target]
+            attempts = 0
+            while len(candidates) < min(self.config.distractor_count + 1, max(1, len(ids) * (len(ids) - 1))) and attempts < 100:
+                attempts += 1
+                cand = tuple(int(x) for x in self.rng.choice(ids, size=2, replace=False))
+                if cand not in candidates:
+                    candidates.append(cand)
+            self.rng.shuffle(candidates)
+            return Task("bundle_trade", target, tuple(candidates))
+        if self.rng.random() < 0.55:
+            target = (int(self.rng.choice(ids)),)
+            return Task("unary_reference", target, self._with_distractors(target, ids))
+        target = tuple(int(x) for x in self.rng.choice(ids, size=2, replace=True))
+        return Task("binary_relation", target, self._with_distractors(target, ids))
+
+    def _decay_conflicts(self, agent: Agent, symbol: str, intended: str) -> None:
+        """Compact a consistent symbol by weakening mutually exclusive alternatives."""
+
+        intended_meaning = self.meanings.get(intended)
+        if intended_meaning is None or intended_meaning.group is None or symbol not in agent.lexicon:
+            return
+        for mid in list(agent.lexicon[symbol]):
+            other = self.meanings.get(mid)
+            if mid != intended and other is not None and other.group == intended_meaning.group:
+                agent.lexicon[symbol][mid] *= 1.0 - (agent.lr_contradiction * 0.5)
+        agent.normalize_symbol(symbol)
+
+    def _score_success(self, intended: str, interpreted: str, world: object, task: Task) -> bool:
+        mh = self.meanings.get(interpreted)
+        if mh is None or mh.arity != len(task.args):
+            return False
+        true_candidates = [args for args in task.candidate_args if mh.holds(world, args)]
+        if not true_candidates:
+            return False
+        selected = true_candidates[int(self.rng.integers(0, len(true_candidates)))]
+        return selected == task.args
+
+    def run_episode(self, episode: int) -> None:
+        world = self.worlds[episode % len(self.worlds)]
+        speaker, hearer = self._sample_agents()
+        task = self._sample_task(world, speaker.id, hearer.id)
+        symbol, intended = speaker.choose_message(task, world, self.meanings)
+        hearer.ensure_symbol(symbol, self.meaning_list)
+        interpreted = hearer.interpret_message(symbol)
+        success = self._score_success(intended, interpreted, world, task)
+
+        # Always measure contradictions so the no-consistency ablation can be
+        # compared directly; the flag only disables contradiction penalties.
+        sp_result = check_theory(speaker, self.worlds, self.meanings, threshold=0.35)
+        hr_result = check_theory(hearer, self.worlds, self.meanings, threshold=0.35)
+
+        speaker.apply_update(symbol, intended, success, sp_result, self.config.consistency_enabled)
+        hearer.apply_update(symbol, intended, success, hr_result, self.config.consistency_enabled)
+        if self.config.consistency_enabled and success:
+            self._decay_conflicts(speaker, symbol, intended)
+            self._decay_conflicts(hearer, symbol, intended)
+        speaker.decay_weights()
+        hearer.decay_weights()
+        if self.config.pruning_enabled:
+            speaker.prune(self.config.prune_threshold)
+            hearer.prune(self.config.prune_threshold)
+        if self.config.innovation_enabled:
+            speaker.innovate(self.config.innovation_prob, self.symbols, self.meaning_list)
+            hearer.innovate(self.config.innovation_prob, self.symbols, self.meaning_list)
+
+        contradictions = sp_result.contradiction_count + hr_result.contradiction_count
+        self.success_window.append(int(success))
+        self.contra_window.append(int(contradictions > 0))
+        self.mean_contra_window.append(float(contradictions) / 2.0)
+
+    def _log_row(self, episode: int) -> None:
+        desc = description_length(self.agents)
+        success_rate = float(np.mean(self.success_window)) if self.success_window else 0.0
+        current_contradictions_t035 = sum(
+            check_theory(agent, self.worlds, self.meanings, threshold=0.35).contradiction_count
+            for agent in self.agents
+        )
+        current_contradictions_t075 = sum(
+            check_theory(agent, self.worlds, self.meanings, threshold=0.75).contradiction_count
+            for agent in self.agents
+        )
+        self.rows.append(
+            {
+                "episode": episode,
+                "seed": self.config.seed,
+                "world_type": self.config.world_type,
+                "n_agents": self.config.n_agents,
+                "consistency_enabled": self.config.consistency_enabled,
+                "initial_conflict_prob": self.config.initial_conflict_prob,
+                "initial_conflict_strength": self.config.initial_conflict_strength,
+                "distractor_count": self.config.distractor_count,
+                "task_mode": "discriminative",
+                "communicative_success_rate": success_rate,
+                "contradiction_rate": float(np.mean(self.contra_window)) if self.contra_window else 0.0,
+                "mean_contradictions": float(np.mean(self.mean_contra_window)) if self.mean_contra_window else 0.0,
+                "active_symbols": active_symbols(self.agents),
+                "active_mappings": active_mappings(self.agents),
+                "high_confidence_mappings": high_confidence_mappings(self.agents),
+                "current_contradictions_t035": current_contradictions_t035,
+                "current_contradictions_t075": current_contradictions_t075,
+                "mean_mapping_entropy": mean_mapping_entropy(self.agents),
+                "lexical_alignment": lexical_alignment(self.agents),
+                "closure_size_proxy": desc,
+                "description_length": desc,
+                "compression_proxy": success_rate / max(desc, 1),
+                "cluster_count": cluster_count(self.agents),
+            }
+        )
+
+    def run(self) -> pd.DataFrame:
+        for episode in range(1, self.config.n_episodes + 1):
+            self.run_episode(episode)
+            if episode % self.config.log_every == 0 or episode == self.config.n_episodes:
+                self._log_row(episode)
+        return pd.DataFrame(self.rows)
